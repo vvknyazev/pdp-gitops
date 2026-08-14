@@ -1,0 +1,418 @@
+alloy:
+
+  # ============================================================
+  # ALLOY CONFIG
+  # ============================================================
+
+  configMap:
+    content: |-
+
+      // ========================================================
+      // METRICS DESTINATION: PROMETHEUS
+      // ========================================================
+
+      prometheus.remote_write "prometheus" {
+        endpoint {
+          url = "http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
+        }
+      }
+
+
+      // ========================================================
+      // ALLOY SELF METRICS
+      //
+      // Metrics about Alloy itself.
+      //
+      // source="alloy-self"
+      // ========================================================
+
+      prometheus.exporter.self "alloy" {}
+
+      prometheus.relabel "alloy_self" {
+        forward_to = [
+          prometheus.remote_write.prometheus.receiver,
+        ]
+
+        rule {
+          target_label = "source"
+          replacement  = "alloy-self"
+        }
+      }
+
+      prometheus.scrape "alloy_self" {
+        targets = prometheus.exporter.self.alloy.targets
+
+        forward_to = [
+          prometheus.relabel.alloy_self.receiver,
+        ]
+      }
+
+
+      // ========================================================
+      // NODE METRICS
+      //
+      // Alloy embeds node_exporter functionality.
+      //
+      // Generates:
+      // node_cpu_seconds_total
+      // node_memory_*
+      // node_filesystem_*
+      // node_network_*
+      //
+      // source="alloy-unix"
+      // ========================================================
+
+      prometheus.exporter.unix "node" {
+        procfs_path = "/host/proc"
+        sysfs_path  = "/host/sys"
+        rootfs_path = "/host/root"
+
+        include_exporter_metrics = true
+      }
+
+      prometheus.relabel "unix" {
+        forward_to = [
+          prometheus.remote_write.prometheus.receiver,
+        ]
+
+        rule {
+          target_label = "source"
+          replacement  = "alloy-unix"
+        }
+      }
+
+      prometheus.scrape "unix" {
+        targets = prometheus.exporter.unix.node.targets
+
+        forward_to = [
+          prometheus.relabel.unix.receiver,
+        ]
+      }
+
+      // ========================================================
+      // KUBERNETES EVENTS
+      // ========================================================
+
+      loki.source.kubernetes_events "events" {
+        job_name   = "kubernetes-events"
+        log_format = "logfmt"
+
+        forward_to = [
+          loki.process.events.receiver,
+        ]
+      }
+
+      loki.process "events" {
+
+        stage.static_labels {
+          values = {
+            source  = "kubernetes-events",
+            cluster = "microk8s",
+          }
+        }
+
+        forward_to = [
+          loki.write.loki.receiver,
+        ]
+      }
+
+      // ========================================================
+      // NGINX METRICS DISCOVERY
+      //
+      // Find Pods:
+      // namespace = pdp
+      // label     = app=nginx
+      // ========================================================
+
+      discovery.kubernetes "nginx" {
+        role = "pod"
+
+        namespaces {
+          names = ["pdp"]
+        }
+
+        selectors {
+          role  = "pod"
+          label = "app=nginx"
+        }
+      }
+
+
+      // ========================================================
+      // NGINX EXPORTER TARGETS
+      //
+      // Keep only container port 9113.
+      //
+      // nginx container:
+      //    :80
+      //    :8080 stub_status
+      //
+      // nginx-exporter:
+      //    :9113 /metrics
+      //
+      // source="nginx-exporter"
+      // ========================================================
+
+      discovery.relabel "nginx_exporter" {
+        targets = discovery.kubernetes.nginx.targets
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_pod_container_port_number",
+          ]
+
+          regex  = "9113"
+          action = "keep"
+        }
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_pod_name",
+          ]
+
+          target_label = "pod"
+        }
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_namespace",
+          ]
+
+          target_label = "namespace"
+        }
+
+        rule {
+          target_label = "source"
+          replacement  = "nginx-exporter"
+        }
+      }
+
+
+      // ========================================================
+      // SCRAPE NGINX PROMETHEUS EXPORTERS
+      // ========================================================
+
+      prometheus.scrape "nginx" {
+        targets = discovery.relabel.nginx_exporter.output
+
+        scrape_interval = "15s"
+
+        forward_to = [
+          prometheus.remote_write.prometheus.receiver,
+        ]
+      }
+
+
+
+      // ========================================================
+      //
+      //                    LOG PIPELINE
+      //
+      // ========================================================
+
+
+      // ========================================================
+      // LOG DESTINATION: LOKI
+      //
+      // Assumes:
+      //
+      // release:   loki
+      // namespace: loki
+      //
+      // Service:
+      // loki-gateway.loki.svc.cluster.local
+      // ========================================================
+
+      loki.write "loki" {
+        endpoint {
+          url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+        }
+      }
+
+
+      // ========================================================
+      // DISCOVER NGINX PODS FOR LOGS
+      //
+      // Separate discovery from nginx metrics discovery.
+      // ========================================================
+
+      discovery.kubernetes "nginx_logs" {
+        role = "pod"
+
+        namespaces {
+          names = ["pdp"]
+        }
+
+        selectors {
+          role  = "pod"
+          label = "app=nginx"
+        }
+      }
+
+
+      // ========================================================
+      // KEEP ONLY THE NGINX CONTAINER
+      //
+      // Pod contains:
+      //
+      // nginx             <- logs we want
+      // nginx-exporter    <- not collected here
+      // ========================================================
+
+      discovery.relabel "nginx_logs" {
+        targets = discovery.kubernetes.nginx_logs.targets
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_pod_container_name",
+          ]
+
+          regex  = "nginx"
+          action = "keep"
+        }
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_pod_name",
+          ]
+
+          target_label = "pod"
+        }
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_namespace",
+          ]
+
+          target_label = "namespace"
+        }
+
+        rule {
+          source_labels = [
+            "__meta_kubernetes_pod_container_name",
+          ]
+
+          target_label = "container"
+        }
+
+        rule {
+          target_label = "job"
+          replacement  = "pdp/nginx"
+        }
+      }
+
+
+      // ========================================================
+      // READ NGINX CONTAINER LOGS
+      //
+      // Equivalent conceptually to continuously doing:
+      //
+      // kubectl logs -f <nginx-pod> -c nginx
+      //
+      // but automatically for discovered nginx Pods.
+      // ========================================================
+
+      loki.source.kubernetes "nginx" {
+        targets = discovery.relabel.nginx_logs.output
+
+        forward_to = [
+          loki.process.nginx.receiver,
+        ]
+      }
+
+
+      // ========================================================
+      // PROCESS NGINX LOGS
+      //
+      // Add useful Loki labels.
+      // ========================================================
+
+      loki.process "nginx" {
+
+        stage.static_labels {
+          values = {
+            app     = "nginx",
+            source  = "alloy",
+            cluster = "microk8s",
+          }
+        }
+
+        forward_to = [
+          loki.write.loki.receiver,
+        ]
+      }
+
+
+  # ============================================================
+  # HOST ENVIRONMENT
+  # ============================================================
+
+  extraEnv:
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+
+
+  # ============================================================
+  # HOST FILESYSTEM MOUNTS
+  #//
+  #// Required for prometheus.exporter.unix.
+  #// ============================================================
+
+  mounts:
+    extra:
+
+      - name: host-proc
+        mountPath: /host/proc
+        readOnly: true
+
+      - name: host-sys
+        mountPath: /host/sys
+        readOnly: true
+
+      - name: host-root
+        mountPath: /host/root
+        readOnly: true
+
+
+
+# ==============================================================
+# ALLOY CONTROLLER
+#
+# DaemonSet = one Alloy Pod per Kubernetes Node.
+# ==============================================================
+
+controller:
+  type: daemonset
+
+  volumes:
+    extra:
+
+      - name: host-proc
+        hostPath:
+          path: /proc
+          type: Directory
+
+      - name: host-sys
+        hostPath:
+          path: /sys
+          type: Directory
+
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
+
+
+
+# ==============================================================
+# ALLOY UI
+#
+# Permanent access without kubectl port-forward.
+# ==============================================================
+
+service:
+  enabled: true
+  type: NodePort
+  nodePort: 30345
