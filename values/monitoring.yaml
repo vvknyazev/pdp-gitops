@@ -2,6 +2,13 @@ grafana:
   service:
     type: NodePort
     nodePort: 30300
+  persistence:
+    enabled: true
+    type: pvc
+    storageClassName: microk8s-hostpath
+    accessModes:
+      - ReadWriteOnce
+    size: 5Gi
 
 prometheus:
   service:
